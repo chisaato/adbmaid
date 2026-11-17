@@ -1,0 +1,185 @@
+name: 多平台打包与发布
+
+# 手动触发执行多平台完整打包（仅产出 Artifacts）；推送 v* 标签时自动创建 GitHub Release
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux (AppImage / deb / rpm)
+            os: ubuntu-22.04
+            artifact: bundle-linux
+          - label: Windows (NSIS / MSI)
+            os: windows-latest
+            artifact: bundle-windows
+          - label: macOS (DMG / App)
+            os: macos-latest
+            artifact: bundle-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 Linux Tauri 打包依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            curl \
+            wget \
+            file
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 执行 Tauri 多平台打包
+        env:
+          # GitHub Actions Linux 容器无 FUSE，使用解包模式打包 AppImage
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: pnpm tauri build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: ignore
+
+      - name: 单独上传 Linux deb 供 Flatpak 打包复用
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+
+  build-flatpak:
+    name: 构建 Linux Flatpak
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 Linux deb 安装包
+        uses: actions/download-artifact@v4
+        with:
+          name: bundle-linux-deb
+          path: packaging/flatpak/debs
+
+      - name: 解包 deb 并准备 Flatpak 元数据
+        run: |
+          dpkg-deb -x packaging/flatpak/debs/*.deb packaging/flatpak/rootfs
+          cat << 'EOF' > packaging/flatpak/com.adbmaid.app.desktop
+          [Desktop Entry]
+          Name=adbmaid
+          Comment=Android 设备可视化工作台
+          Exec=adbmaid
+          Icon=com.adbmaid.app
+          Type=Application
+          Categories=Development;Utility;
+          Terminal=false
+          EOF
+          cat << 'EOF' > packaging/flatpak/com.adbmaid.app.metainfo.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <component type="desktop-application">
+            <id>com.adbmaid.app</id>
+            <name>adbmaid</name>
+            <summary>Android 设备可视化工作台</summary>
+            <metadata_license>MIT</metadata_license>
+            <project_license>MIT</project_license>
+            <description>
+              <p>基于 Tauri v2 的 Android ADB 设备可视化工作台。</p>
+            </description>
+            <launchable type="desktop-id">com.adbmaid.app.desktop</launchable>
+          </component>
+          EOF
+
+      - name: 安装 flatpak 与 flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: 构建 Flatpak 单文件包
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: adbmaid-x86_64.flatpak
+          manifest-path: packaging/flatpak/com.adbmaid.app.yml
+          cache-key: flatpak-24.08-${{ hashFiles('packaging/flatpak/com.adbmaid.app.yml') }}
+
+      - name: 上传 Flatpak 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-linux-flatpak
+          path: adbmaid-x86_64.flatpak
+
+  release:
+    name: 发布 GitHub Release
+    needs: [build, build-flatpak]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 汇总所有平台构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts-raw
+
+      - name: 整理发布文件列表
+        run: |
+          mkdir -p release-assets
+          find artifacts-raw -type f \( \
+            -name '*.AppImage' -o \
+            -name '*.deb' -o \
+            -name '*.rpm' -o \
+            -name '*.flatpak' -o \
+            -name '*.exe' -o \
+            -name '*.msi' -o \
+            -name '*.dmg' \
+          \) -exec cp -v {} release-assets/ \;
+
+      - name: 创建并上传 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

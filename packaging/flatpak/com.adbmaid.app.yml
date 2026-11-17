@@ -1,0 +1,26 @@
+id: com.adbmaid.app
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: adbmaid
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --share=network
+  - --filesystem=home
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+
+modules:
+  - name: adbmaid
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 rootfs/usr/bin/adbmaid /app/bin/adbmaid
+      - install -Dm644 rootfs/usr/share/icons/hicolor/128x128/apps/adbmaid.png /app/share/icons/hicolor/128x128/apps/com.adbmaid.app.png
+      - install -Dm644 com.adbmaid.app.desktop /app/share/applications/com.adbmaid.app.desktop
+      - install -Dm644 com.adbmaid.app.metainfo.xml /app/share/metainfo/com.adbmaid.app.metainfo.xml
+    sources:
+      - type: dir
+        path: .
